@@ -4,6 +4,11 @@
 #include <torch/types.h>
 
 #include <ATen/cuda/CUDAApplyUtils.cuh>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+#include <thrust/scan.h>
+#include <thrust/sort.h>
+#include <thrust/system/cuda/execution_policy.h>
 
 #define CHECK_CUDA(x) \
   TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
@@ -146,6 +151,105 @@ __global__ void point_to_voxelidx_kernel(const T_int* coor,
   }
 }
 
+// Build voxel sort key: valid points get packed key, invalid get INT64_MAX
+__global__ void build_voxel_key_kernel(const int* coor, int64_t* keys,
+                                       const int grid_y, const int grid_z,
+                                       const int num_points, const int NDim) {
+  const int64_t INVALID_KEY = 0x7FFFFFFFFFFFFFFFL;
+  const int64_t grid_yz = static_cast<int64_t>(grid_y) * grid_z;
+
+  CUDA_1D_KERNEL_LOOP(index, num_points) {
+    auto coor_offset = coor + index * NDim;
+    if (coor_offset[0] == -1) {
+      keys[index] = INVALID_KEY;
+    } else {
+      int64_t c_x = coor_offset[0];
+      int64_t c_y = coor_offset[1];
+      int64_t c_z = coor_offset[2];
+      keys[index] =
+          c_x * grid_yz + c_y * static_cast<int64_t>(grid_z) + c_z;
+    }
+  }
+}
+
+// Fill point_to_voxelidx and point_to_pointidx from sorted order.
+// Parallel version: each thread handles one point. For each pos, find how many
+// preceding points share the same voxel_key (backward scan, O(max_points) per
+// thread since same-voxel points typically <= max_points).
+// sorted_indices[pos] = original point index with pos-th smallest key.
+template <typename T_int>
+__global__ void fill_point_to_voxelidx_from_sorted_kernel(
+    const int64_t* keys, const int* sorted_indices, T_int* point_to_voxelidx,
+    T_int* point_to_pointidx, const int max_points, const int num_points) {
+  const int64_t INVALID_KEY = 0x7FFFFFFFFFFFFFFFL;
+
+  CUDA_1D_KERNEL_LOOP(pos, num_points) {
+    int orig_idx = sorted_indices[pos];
+    int64_t key = keys[pos];
+
+    if (key == INVALID_KEY) continue;
+
+    // Count preceding points with same voxel_key (segment start at segment_start_pos)
+    int segment_start_pos = pos;
+    while (segment_start_pos > 0 && keys[segment_start_pos - 1] == key) {
+      segment_start_pos--;
+    }
+    int point_pos_in_voxel = pos - segment_start_pos;  // 0 for first in voxel
+    int segment_start_orig_idx = sorted_indices[segment_start_pos];
+
+    point_to_pointidx[orig_idx] = segment_start_orig_idx;
+    if (point_pos_in_voxel < max_points) {
+      point_to_voxelidx[orig_idx] = point_pos_in_voxel;
+    }
+  }
+}
+
+// flag[i]=1 if point i is first in voxel (point_to_voxelidx==0), else 0
+__global__ void determin_voxel_flag_kernel(const int* point_to_voxelidx,
+                                          int* flag, const int num_points) {
+  CUDA_1D_KERNEL_LOOP(i, num_points) {
+    flag[i] = (point_to_voxelidx[i] == 0) ? 1 : 0;
+  }
+}
+
+// Assign voxel idx to segment starts from exclusive scan result
+__global__ void assign_voxel_idx_from_scan_kernel(
+    const int* point_to_voxelidx, const int* scan_result,
+    int* coor_to_voxelidx, int* voxel_num, const int max_voxels,
+    const int num_points) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    int last_flag = (num_points > 0 && point_to_voxelidx[num_points - 1] == 0)
+                        ? 1
+                        : 0;
+    int total_segments =
+        (num_points > 0) ? (scan_result[num_points - 1] + last_flag) : 0;
+    voxel_num[0] = total_segments < max_voxels ? total_segments : max_voxels;
+  }
+  CUDA_1D_KERNEL_LOOP(i, num_points) {
+    if (point_to_voxelidx[i] == 0) {
+      int voxelidx = scan_result[i];
+      coor_to_voxelidx[i] = (voxelidx < max_voxels) ? voxelidx : -1;
+    }
+  }
+}
+
+// Propagate voxel idx from first point to others, then count points per voxel
+__global__ void propagate_and_count_kernel(const int* point_to_voxelidx,
+                                           const int* point_to_pointidx,
+                                           int* coor_to_voxelidx,
+                                           int* num_points_per_voxel,
+                                           const int num_points) {
+  CUDA_1D_KERNEL_LOOP(i, num_points) {
+    if (point_to_voxelidx[i] > 0) {
+      coor_to_voxelidx[i] = coor_to_voxelidx[point_to_pointidx[i]];
+    }
+    int voxelidx = coor_to_voxelidx[i];
+    if (voxelidx >= 0) {
+      atomicAdd(&num_points_per_voxel[voxelidx], 1);
+    }
+  }
+}
+
 template <typename T_int>
 __global__ void determin_voxel_num(
     // const T_int* coor,
@@ -278,56 +382,99 @@ int hard_voxelize_gpu(const at::Tensor& points, at::Tensor& voxels,
   cudaDeviceSynchronize();
   AT_CUDA_CHECK(cudaGetLastError());
 
-  // 2. map point to the idx of the corresponding voxel, find duplicate coor
-  // create some temporary variables
+  // 2. map point to idx of corresponding voxel (optimized: sort + O(n) instead
+  // of O(n^2))
   auto point_to_pointidx = -at::ones(
-      {
-          num_points,
-      },
-      points.options().dtype(at::kInt));
+      {num_points}, points.options().dtype(at::kInt));
   auto point_to_voxelidx = -at::ones(
-      {
-          num_points,
-      },
-      points.options().dtype(at::kInt));
+      {num_points}, points.options().dtype(at::kInt));
 
-  dim3 map_grid(std::min(at::cuda::ATenCeilDiv(num_points, 512), 4096));
-  dim3 map_block(512);
-  AT_DISPATCH_ALL_TYPES(
-      temp_coors.scalar_type(), "determin_duplicate", ([&] {
-        point_to_voxelidx_kernel<int>
-            <<<map_grid, map_block, 0, at::cuda::getCurrentCUDAStream()>>>(
-                temp_coors.contiguous().data_ptr<int>(),
-                point_to_voxelidx.contiguous().data_ptr<int>(),
-                point_to_pointidx.contiguous().data_ptr<int>(), max_points,
-                max_voxels, num_points, NDim);
-      }));
+  auto voxel_keys =
+      at::empty({num_points}, points.options().dtype(at::kLong));
+  auto sorted_indices = at::arange(
+      num_points,
+      at::TensorOptions().dtype(at::kInt).device(points.device()));
+
+  build_voxel_key_kernel<<<grid, block, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+      temp_coors.contiguous().data_ptr<int>(),
+      voxel_keys.contiguous().data_ptr<int64_t>(), grid_y, grid_z, num_points,
+      NDim);
   cudaDeviceSynchronize();
   AT_CUDA_CHECK(cudaGetLastError());
 
-  // 3. determined voxel num and voxel's coor index
-  // make the logic in the CUDA device could accelerate about 10 times
-  auto coor_to_voxelidx = -at::ones(
-      {
-          num_points,
-      },
-      points.options().dtype(at::kInt));
-  auto voxel_num = at::zeros(
-      {
-          1,
-      },
-      points.options().dtype(at::kInt));  // must be zero from the beginning
+  {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    thrust::device_ptr<int64_t> keys_ptr(
+        voxel_keys.contiguous().data_ptr<int64_t>());
+    thrust::device_ptr<int> indices_ptr(
+        sorted_indices.contiguous().data_ptr<int>());
+    thrust::stable_sort_by_key(thrust::cuda::par.on(stream), keys_ptr,
+                               keys_ptr + num_points, indices_ptr);
+  }
+  cudaDeviceSynchronize();
+  AT_CUDA_CHECK(cudaGetLastError());
 
-  AT_DISPATCH_ALL_TYPES(
-      temp_coors.scalar_type(), "determin_duplicate", ([&] {
-        determin_voxel_num<int><<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
-            num_points_per_voxel.contiguous().data_ptr<int>(),
-            point_to_voxelidx.contiguous().data_ptr<int>(),
-            point_to_pointidx.contiguous().data_ptr<int>(),
-            coor_to_voxelidx.contiguous().data_ptr<int>(),
-            voxel_num.contiguous().data_ptr<int>(), max_points, max_voxels,
-            num_points);
-      }));
+  dim3 fill_grid(std::min(at::cuda::ATenCeilDiv(num_points, 512), 4096));
+  dim3 fill_block(512);
+  fill_point_to_voxelidx_from_sorted_kernel<int>
+      <<<fill_grid, fill_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          voxel_keys.contiguous().data_ptr<int64_t>(),
+          sorted_indices.contiguous().data_ptr<int>(),
+          point_to_voxelidx.contiguous().data_ptr<int>(),
+          point_to_pointidx.contiguous().data_ptr<int>(), max_points,
+          num_points);
+  cudaDeviceSynchronize();
+  AT_CUDA_CHECK(cudaGetLastError());
+
+  // 3. Determine voxel num and coor index (4 steps: flag, scan, assign,
+  // propagate+count). Use flag+exclusive_scan for Thrust compatibility (no
+  // transform_exclusive_scan on older/custom Thrust).
+  auto coor_to_voxelidx =
+      -at::ones({num_points}, points.options().dtype(at::kInt));
+  auto voxel_num = at::zeros({1}, points.options().dtype(at::kInt));
+  auto flag = at::empty({num_points}, points.options().dtype(at::kInt));
+  auto scan_result = at::empty({num_points}, points.options().dtype(at::kInt));
+
+  dim3 map_grid(std::min(at::cuda::ATenCeilDiv(num_points, 512), 4096));
+  dim3 map_block(512);
+
+  //  确定哪些点是体素首点
+  determin_voxel_flag_kernel<<<map_grid, map_block, 0,
+                               at::cuda::getCurrentCUDAStream()>>>(
+      point_to_voxelidx.contiguous().data_ptr<int>(),
+      flag.contiguous().data_ptr<int>(), num_points);
+  cudaDeviceSynchronize();
+  AT_CUDA_CHECK(cudaGetLastError());
+
+  // 结果can_result[i] = 在点 i 之前有多少个体素首点 
+  {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    thrust::device_ptr<int> flag_ptr(flag.contiguous().data_ptr<int>());
+    thrust::device_ptr<int> scan_ptr(scan_result.contiguous().data_ptr<int>());
+    thrust::exclusive_scan(thrust::cuda::par.on(stream), flag_ptr,
+                          flag_ptr + num_points, scan_ptr);
+  }
+  cudaDeviceSynchronize();
+  AT_CUDA_CHECK(cudaGetLastError());
+
+  // 只给体素首点写上 coor_to_voxelidx，并写出 voxel_num。
+  assign_voxel_idx_from_scan_kernel<<<map_grid, map_block, 0,
+                                      at::cuda::getCurrentCUDAStream()>>>(
+      point_to_voxelidx.contiguous().data_ptr<int>(),
+      scan_result.contiguous().data_ptr<int>(),
+      coor_to_voxelidx.contiguous().data_ptr<int>(),
+      voxel_num.contiguous().data_ptr<int>(), max_voxels, num_points);
+  cudaDeviceSynchronize();
+  AT_CUDA_CHECK(cudaGetLastError());
+
+  // 给非体素首点写上 coor_to_voxelidx，并统计每个体素有多少点。
+  propagate_and_count_kernel<<<map_grid, map_block, 0,
+                               at::cuda::getCurrentCUDAStream()>>>(
+      point_to_voxelidx.contiguous().data_ptr<int>(),
+      point_to_pointidx.contiguous().data_ptr<int>(),
+      coor_to_voxelidx.contiguous().data_ptr<int>(),
+      num_points_per_voxel.contiguous().data_ptr<int>(), num_points);
   cudaDeviceSynchronize();
   AT_CUDA_CHECK(cudaGetLastError());
 

@@ -50,7 +50,7 @@ model = dict(
             max_num_points=10,
             point_cloud_range=[-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
             voxel_size=[0.075, 0.075, 0.2],
-            max_voxels=[120000, 160000],
+            max_voxels= [120000, 160000], #[60000, 80000],
             voxelize_reduce=True)),
     pts_voxel_encoder=dict(type='HardSimpleVFE', num_features=5),
     pts_middle_encoder=dict(
@@ -362,7 +362,7 @@ param_scheduler = [
 ]
 
 # runtime settings
-train_cfg = dict(by_epoch=True, max_epochs=20, val_interval=5)
+train_cfg = dict(by_epoch=True, max_epochs=1, val_interval=20)
 val_cfg = dict()
 test_cfg = dict()
 
@@ -370,6 +370,12 @@ optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=dict(type='AdamW', lr=lr, weight_decay=0.01),
     clip_grad=dict(max_norm=35, norm_type=2))
+
+# optim_wrapper = dict(
+#     type='AmpOptimWrapper',
+#     loss_scale='dynamic',
+#     optimizer=dict(type='AdamW', lr=lr, weight_decay=0.01),
+#     clip_grad=dict(max_norm=35, norm_type=2))
 
 # Default setting for scaling LR automatically
 #   - `enable` means enable scaling LR automatically
@@ -379,6 +385,6 @@ auto_scale_lr = dict(enable=False, base_batch_size=32)
 log_processor = dict(window_size=50)
 
 default_hooks = dict(
-    logger=dict(type='LoggerHook', interval=50),
+    logger=dict(type='LoggerHook', interval=1),
     checkpoint=dict(type='CheckpointHook', interval=5))
 custom_hooks = [dict(type='DisableObjectSampleHook', disable_after_epoch=15)]

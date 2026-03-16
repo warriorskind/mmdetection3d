@@ -127,9 +127,9 @@ class BEVFusionSparseEncoder(SparseEncoder):
                 module returns middle features.
         """
         coors = coors.int()
-        input_sp_tensor = SparseConvTensor(voxel_features, coors,
-                                           self.sparse_shape, batch_size)
-        x = self.conv_input(input_sp_tensor)
+        input_sp_tensor = SparseConvTensor(voxel_features, coors,         # voxel_features: [655786, 5]
+                                           self.sparse_shape, batch_size) # coors: [655786, 4]
+        x = self.conv_input(input_sp_tensor)                              # self.sparse_shape [1440, 1440, 41]
 
         encode_features = []
         for encoder_layer in self.encoder_layers:

@@ -42,40 +42,47 @@ __device__ __forceinline__ static void reduceMax(double *address, double val) {
 }
 
 // get rid of meaningless warnings when compiling host code
-#ifdef __CUDA_ARCH__
-__device__ __forceinline__ static void reduceAdd(float *address, float val) {
-#if (__CUDA_ARCH__ < 200)
-#warning \
-    "compute capability lower than 2.x. fall back to use CAS version of atomicAdd for float32"
-  int *address_as_i = reinterpret_cast<int *>(address);
-  int old = *address_as_i, assumed;
-  do {
-    assumed = old;
-    old = atomicCAS(address_as_i, assumed,
-                    __float_as_int(val + __int_as_float(assumed)));
-  } while (assumed != old);
-#else
-  atomicAdd(address, val);
-#endif
-}
+//#ifdef __CUDA_ARCH__
+//__device__ __forceinline__ static void reduceAdd(float *address, float val) {
+//#if (__CUDA_ARCH__ < 200)
+//#warning \
+//    "compute capability lower than 2.x. fall back to use CAS version of atomicAdd for float32"
+//  int *address_as_i = reinterpret_cast<int *>(address);
+//  int old = *address_as_i, assumed;
+//  do {
+//    assumed = old;
+//    old = atomicCAS(address_as_i, assumed,
+//                    __float_as_int(val + __int_as_float(assumed)));
+//  } while (assumed != old);
+//#else
+//  atomicAdd(address, val);
+//#endif
+//}
 
-__device__ __forceinline__ static void reduceAdd(double *address, double val) {
-#if (__CUDA_ARCH__ < 600)
-#warning \
-    "compute capability lower than 6.x. fall back to use CAS version of atomicAdd for float64"
-  unsigned long long *address_as_ull =
-      reinterpret_cast<unsigned long long *>(address);
-  unsigned long long old = *address_as_ull, assumed;
-  do {
-    assumed = old;
-    old = atomicCAS(address_as_ull, assumed,
-                    __double_as_longlong(val + __longlong_as_double(assumed)));
-  } while (assumed != old);
-#else
+//__device__ __forceinline__ static void reduceAdd(double *address, double val) {
+//#if (__CUDA_ARCH__ < 600)
+//#warning \
+//    "compute capability lower than 6.x. fall back to use CAS version of atomicAdd for float64"
+//  unsigned long long *address_as_ull =
+//      reinterpret_cast<unsigned long long *>(address);
+//  unsigned long long old = *address_as_ull, assumed;
+//  do {
+//    assumed = old;
+//    old = atomicCAS(address_as_ull, assumed,
+//                    __double_as_longlong(val + __longlong_as_double(assumed)));
+//  } while (assumed != old);
+//#else
+//  atomicAdd(address, val);
+//#endif
+//}
+//#endif
+
+__device__ __forceinline__ static void reduceAdd(float *address, float val) {
   atomicAdd(address, val);
-#endif
 }
-#endif
+__device__ __forceinline__ static void reduceAdd(double *address, double val) {
+  atomicAdd(address, val);
+}
 
 template <typename T>
 __global__ void
